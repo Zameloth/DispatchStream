@@ -4,6 +4,7 @@ import fr.esgi.kafka.dispatch.common.DlqEnvelope;
 import fr.esgi.kafka.dispatch.common.EventValidator;
 import fr.esgi.kafka.dispatch.common.JsonSerdes;
 import fr.esgi.kafka.dispatch.common.ValidationOutcome;
+import fr.esgi.kafka.dispatch.detection.GhostTripDetection;
 import fr.esgi.kafka.dispatch.model.DemandByZone;
 import fr.esgi.kafka.dispatch.model.DriverLocation;
 import fr.esgi.kafka.dispatch.model.RideRequest;
@@ -94,6 +95,7 @@ public class TopologyProducer {
         // DISP-4 - Surge pricing (demande/offre > 2)     -> Topics.SURGE
         buildSurge(demandByZone, supplyByZone);
         // DISP-5 - Courses anormales (vitesse, duree)    -> Topics.ALERTS_TRIPS
+        publishGhostTripAlerts(validTripEvents);
         // DISP-6 (bonus) - API REST Interactive Queries : GET /api/v1/surge/{zone}
 
         return builder.build();
@@ -189,6 +191,22 @@ public class TopologyProducer {
                 .filter((zone, ratio) -> ratio > 2.0)
                 .mapValues((zone, ratio) -> JsonSerdes.toJson(new SurgeEvent(zone, ratio)))
                 .to(Topics.SURGE, Produced.with(Serdes.String(), Serdes.String()));
+    }
+
+    /**
+     * DISP-5 (issue #9) : sur les END du flux valide (issue #4, orphan-END
+     * hors-perimetre cf. ADR 0003), evalue chaque course via
+     * GhostTripDetection (vitesse moyenne > 130 km/h ou duree > 3h) et
+     * publie une alerte pour celles qui matchent. START ignore : il ne
+     * porte ni distance_km ni duration_seconds (cf. TripEvent).
+     */
+    private void publishGhostTripAlerts(KStream<String, TripEvent> validTripEvents) {
+        validTripEvents
+                .filter((tripId, event) -> "END".equals(event.event()))
+                .mapValues(GhostTripDetection::evaluate)
+                .filter((tripId, alert) -> alert.isPresent())
+                .mapValues(alert -> JsonSerdes.toJson(alert.get()))
+                .to(Topics.ALERTS_TRIPS, Produced.with(Serdes.String(), Serdes.String()));
     }
 
     /**
