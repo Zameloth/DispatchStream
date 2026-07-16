@@ -200,6 +200,12 @@ local, créez-les d'abord dans Kafbat UI (mêmes noms, 3 partitions suffisent),
 puis produisez des messages à la main avec les exemples JSON ci-dessus. Sur le
 cluster partagé, ils existent déjà (`KAFKA_BOOTSTRAP=<serveur>:9092`).
 
+### Dashboard (optionnel)
+
+Un dashboard Streamlit local (`dashboard/`) permet de visualiser le pipeline
+en direct pendant un rejeu (`scripts/rejouer.py`) — voir `dashboard/README.md`
+pour le lancer.
+
 ## Contraintes
 
 - Java 21, Quarkus + Kafka Streams uniquement (pas de Spark/Flink), pas de

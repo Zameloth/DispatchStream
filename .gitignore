@@ -15,5 +15,10 @@ target/
 # OS
 .DS_Store
 
+# Python (dashboard/, scripts/)
+__pycache__/
+*.pyc
+.venv/
+
 # Claude Code local state (personal settings, agent worktrees)
 .claude/
