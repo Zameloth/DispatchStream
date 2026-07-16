@@ -2,6 +2,7 @@ package fr.esgi.kafka.dispatch.validation;
 
 import fr.esgi.kafka.dispatch.common.EventValidator;
 import fr.esgi.kafka.dispatch.common.ValidationStep;
+import fr.esgi.kafka.dispatch.common.Zones;
 import fr.esgi.kafka.dispatch.model.RideRequest;
 import fr.esgi.kafka.dispatch.model.RideRequest.GeoPoint;
 
@@ -21,13 +22,11 @@ import java.util.function.Function;
 public final class RideRequestValidation {
 
     /**
-     * Les 12 zones fixes de Paris (README.md, section "Les 12 zones") :
-     * liste canonique donnee par le sujet, pas un choix arbitraire.
+     * Les 12 zones fixes de Paris. Centralisees dans common.Zones (issue
+     * #3) car DriverLocationValidation en a desormais besoin aussi ; ce
+     * champ est conserve pour compatibilite ascendante de l'API publique.
      */
-    public static final Set<String> KNOWN_ZONES = Set.of(
-            "Z-CHATELET", "Z-MONTMARTRE", "Z-BASTILLE", "Z-BERCY", "Z-DEFENSE",
-            "Z-ETOILE", "Z-MONTPARNASSE", "Z-BELLEVILLE", "Z-ODEON", "Z-PIGALLE",
-            "Z-NATION", "Z-AUTEUIL");
+    public static final Set<String> KNOWN_ZONES = Zones.KNOWN_ZONES;
 
     /** Bornes de validite GPS pour ce projet (README.md / CONTEXT.md). */
     private static final double MIN_LAT = 48.7;
