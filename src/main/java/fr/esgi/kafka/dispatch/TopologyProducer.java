@@ -1,6 +1,7 @@
 package fr.esgi.kafka.dispatch;
 
 import fr.esgi.kafka.dispatch.common.DlqEnvelope;
+import fr.esgi.kafka.dispatch.common.EventValidator;
 import fr.esgi.kafka.dispatch.common.JsonSerdes;
 import fr.esgi.kafka.dispatch.common.ValidationOutcome;
 import fr.esgi.kafka.dispatch.model.DriverLocation;
@@ -51,79 +52,23 @@ public class TopologyProducer {
         //   Parser (model.RideRequest / DriverLocation / TripEvent), valider
         //   (dont bornes GPS Paris : lat 48.7-49.0, lon 2.2-2.5), router les
         //   invalides vers Topics.DLQ avec message original + raison.
-        //   Pistes : split()/branch(), JsonSerdes.parseOrNull(...).
+        //   Meme parse deux-phases + chaine de regles metier a court-circuit
+        //   pour les trois flux (cf. common.EventValidator, ADR 0004),
+        //   regles propres a chaque type dans validation.*Validation.
         // -----------------------------------------------------------------
 
-        // dispatch.ride.requests : parse deux-phases + chaine de regles
-        // metier a court-circuit (cf. common.EventValidator, ADR 0004),
-        // regles propres a RideRequest dans validation.RideRequestValidation.
-        KStream<String, ValidationOutcome<RideRequest>> rideRequestOutcomes =
-                rawRequests.mapValues(RideRequestValidation.VALIDATOR::validate);
+        // Flux types, exploites par DISP-2/3/5+ (demande/offre par zone,
+        // courses anormales...).
+        KStream<String, RideRequest> validRideRequests = validateAndRouteToDlq(
+                rawRequests, RideRequestValidation.VALIDATOR, Topics.RIDE_REQUESTS);
 
-        // Flux type, exploite par DISP-2/3+ (demande/offre par zone...).
-        KStream<String, RideRequest> validRideRequests = rideRequestOutcomes
-                .filter((key, outcome) -> outcome instanceof ValidationOutcome.Valid<RideRequest>)
-                .mapValues(outcome -> ((ValidationOutcome.Valid<RideRequest>) outcome).value());
+        KStream<String, DriverLocation> validDriverLocations = validateAndRouteToDlq(
+                rawLocations, DriverLocationValidation.VALIDATOR, Topics.DRIVER_LOCATIONS);
 
-        rideRequestOutcomes
-                .filter((key, outcome) -> outcome instanceof ValidationOutcome.Invalid<RideRequest>)
-                .map((key, outcome) -> {
-                    ValidationOutcome.Invalid<RideRequest> invalid =
-                            (ValidationOutcome.Invalid<RideRequest>) outcome;
-                    DlqEnvelope envelope = new DlqEnvelope(
-                            Topics.RIDE_REQUESTS, key, invalid.raw(), invalid.reason(),
-                            Instant.now().toString());
-                    return KeyValue.pair(key, JsonSerdes.toJson(envelope));
-                })
-                .to(Topics.DLQ, Produced.with(Serdes.String(), Serdes.String()));
-
-        // dispatch.driver.locations : meme parse deux-phases + chaine de
-        // regles metier a court-circuit (cf. common.EventValidator, ADR
-        // 0004), regles propres a DriverLocation dans
-        // validation.DriverLocationValidation.
-        KStream<String, ValidationOutcome<DriverLocation>> driverLocationOutcomes =
-                rawLocations.mapValues(DriverLocationValidation.VALIDATOR::validate);
-
-        // Flux type, exploite par DISP-3+ (offre par zone...).
-        KStream<String, DriverLocation> validDriverLocations = driverLocationOutcomes
-                .filter((key, outcome) -> outcome instanceof ValidationOutcome.Valid<DriverLocation>)
-                .mapValues(outcome -> ((ValidationOutcome.Valid<DriverLocation>) outcome).value());
-
-        driverLocationOutcomes
-                .filter((key, outcome) -> outcome instanceof ValidationOutcome.Invalid<DriverLocation>)
-                .map((key, outcome) -> {
-                    ValidationOutcome.Invalid<DriverLocation> invalid =
-                            (ValidationOutcome.Invalid<DriverLocation>) outcome;
-                    DlqEnvelope envelope = new DlqEnvelope(
-                            Topics.DRIVER_LOCATIONS, key, invalid.raw(), invalid.reason(),
-                            Instant.now().toString());
-                    return KeyValue.pair(key, JsonSerdes.toJson(envelope));
-                })
-                .to(Topics.DLQ, Produced.with(Serdes.String(), Serdes.String()));
-
-        // dispatch.trip.events : meme parse deux-phases + chaine de regles
-        // metier a court-circuit, regles propres a TripEvent dans
-        // validation.TripEventValidation. Correlation START/END (orphan
-        // END) hors-perimetre ici, cf. ADR 0003 / TripEventValidation.
-        KStream<String, ValidationOutcome<TripEvent>> tripEventOutcomes =
-                rawTrips.mapValues(TripEventValidation.VALIDATOR::validate);
-
-        // Flux type, exploite par DISP-5 (courses anormales...).
-        KStream<String, TripEvent> validTripEvents = tripEventOutcomes
-                .filter((key, outcome) -> outcome instanceof ValidationOutcome.Valid<TripEvent>)
-                .mapValues(outcome -> ((ValidationOutcome.Valid<TripEvent>) outcome).value());
-
-        tripEventOutcomes
-                .filter((key, outcome) -> outcome instanceof ValidationOutcome.Invalid<TripEvent>)
-                .map((key, outcome) -> {
-                    ValidationOutcome.Invalid<TripEvent> invalid =
-                            (ValidationOutcome.Invalid<TripEvent>) outcome;
-                    DlqEnvelope envelope = new DlqEnvelope(
-                            Topics.TRIP_EVENTS, key, invalid.raw(), invalid.reason(),
-                            Instant.now().toString());
-                    return KeyValue.pair(key, JsonSerdes.toJson(envelope));
-                })
-                .to(Topics.DLQ, Produced.with(Serdes.String(), Serdes.String()));
+        // Correlation START/END (orphan END) hors-perimetre ici,
+        // cf. ADR 0003 / TripEventValidation.
+        KStream<String, TripEvent> validTripEvents = validateAndRouteToDlq(
+                rawTrips, TripEventValidation.VALIDATOR, Topics.TRIP_EVENTS);
 
         // DISP-2 - Demande par zone (tumbling 2 min)     -> Topics.DEMAND_BY_ZONE
         // DISP-3 - Offre par zone (KTable des chauffeurs) -> Topics.SUPPLY_BY_ZONE
@@ -132,5 +77,35 @@ public class TopologyProducer {
         // DISP-6 (bonus) - API REST Interactive Queries : GET /api/v1/surge/{zone}
 
         return builder.build();
+    }
+
+    /**
+     * Valide un flux brut via un EventValidator et le scinde en deux :
+     * le flux type des messages valides (retourne, exploite par les
+     * tickets suivants) et le flux des invalides, routes vers Topics.DLQ
+     * sous forme de DlqEnvelope (cf. ADR 0004). Factorise le cablage
+     * commun aux trois flux d'entree (issues #2/#3/#4).
+     */
+    private <T> KStream<String, T> validateAndRouteToDlq(
+            KStream<String, String> raw, EventValidator<T> validator, String sourceTopic) {
+
+        KStream<String, ValidationOutcome<T>> outcomes = raw.mapValues(validator::validate);
+
+        KStream<String, T> valid = outcomes
+                .filter((key, outcome) -> outcome instanceof ValidationOutcome.Valid<T>)
+                .mapValues(outcome -> ((ValidationOutcome.Valid<T>) outcome).value());
+
+        outcomes
+                .filter((key, outcome) -> outcome instanceof ValidationOutcome.Invalid<T>)
+                .map((key, outcome) -> {
+                    ValidationOutcome.Invalid<T> invalid = (ValidationOutcome.Invalid<T>) outcome;
+                    DlqEnvelope envelope = new DlqEnvelope(
+                            sourceTopic, key, invalid.raw(), invalid.reason(),
+                            Instant.now().toString());
+                    return KeyValue.pair(key, JsonSerdes.toJson(envelope));
+                })
+                .to(Topics.DLQ, Produced.with(Serdes.String(), Serdes.String()));
+
+        return valid;
     }
 }

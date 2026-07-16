@@ -1,11 +1,10 @@
 package fr.esgi.kafka.dispatch.validation;
 
 import fr.esgi.kafka.dispatch.common.EventValidator;
+import fr.esgi.kafka.dispatch.common.Timestamps;
 import fr.esgi.kafka.dispatch.common.ValidationStep;
 import fr.esgi.kafka.dispatch.model.TripEvent;
 
-import java.time.Instant;
-import java.time.format.DateTimeParseException;
 import java.util.List;
 import java.util.Set;
 
@@ -32,7 +31,7 @@ public final class TripEventValidation {
             ValidationStep.of(t -> t.event() == null || KNOWN_EVENTS.contains(t.event()), "unknown_event"),
             ValidationStep.of(t -> t.distanceKm() == null || t.distanceKm() >= 0, "invalid_distance_km"),
             ValidationStep.of(t -> t.durationSeconds() == null || t.durationSeconds() > 0, "invalid_duration_seconds"),
-            ValidationStep.of(t -> isParseableTimestamp(t.timestamp()), "unparseable_timestamp"));
+            ValidationStep.of(t -> Timestamps.isParseable(t.timestamp()), "unparseable_timestamp"));
 
     public static final EventValidator<TripEvent> VALIDATOR =
             new EventValidator<>(TripEvent.class, STEPS);
@@ -42,17 +41,5 @@ public final class TripEventValidation {
 
     private static boolean isEnd(TripEvent t) {
         return "END".equals(t.event());
-    }
-
-    private static boolean isParseableTimestamp(String timestamp) {
-        if (timestamp == null) {
-            return false;
-        }
-        try {
-            Instant.parse(timestamp);
-            return true;
-        } catch (DateTimeParseException e) {
-            return false;
-        }
     }
 }
