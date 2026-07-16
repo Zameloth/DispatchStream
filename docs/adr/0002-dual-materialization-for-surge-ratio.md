@@ -1,0 +1,5 @@
+# Dual materialization for surge ratio
+
+DISP-4 computes `demand / max(supply, 1)` per zone. DISP-6's interactive query API needs to return the *current* ratio for any of the 12 zones, but the public `dispatch.surge` topic should only carry actual surge incidents (ratio > 2). We chose to **materialize every zone's computed ratio on every demand update** into the state store backing `SurgeResource`, and apply the `>2` threshold filter only when publishing to the `dispatch.surge` topic.
+
+If the queryable store were instead built directly from the filtered `surge` topic, a zone's entry would only ever be written while it was actively surging, and would never be overwritten once the ratio dropped back below 2 — the API would keep reporting a defunct surge as current, with no way to distinguish "still surging" from "surged ten minutes ago and stopped." Materializing the unfiltered computation avoids that staleness at negligible extra cost, while keeping the public topic a clean feed of real incidents.
