@@ -174,7 +174,8 @@ public class TopologyProducer {
     private void buildSurge(KTable<Windowed<String>, Long> demandByZone, KTable<String, Long> supplyByZone) {
         KTable<String, Long> currentDemandByZone = demandByZone.toStream()
                 .selectKey((windowedZone, count) -> windowedZone.key())
-                .repartition(Repartitioned.with(Serdes.String(), Serdes.Long()))
+                .repartition(Repartitioned.<String, Long>with(Serdes.String(), Serdes.Long())
+                        .withName("surge-demand-by-zone"))
                 .toTable(Materialized.with(Serdes.String(), Serdes.Long()));
 
         KTable<String, Double> surgeRatioByZone = currentDemandByZone.leftJoin(
