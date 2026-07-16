@@ -1,0 +1,19 @@
+# Maven
+target/
+
+# IDE
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+.vscode/
+
+# Quarkus
+.quarkus/
+
+# OS
+.DS_Store
+
+# Claude Code local state (personal settings, agent worktrees)
+.claude/
