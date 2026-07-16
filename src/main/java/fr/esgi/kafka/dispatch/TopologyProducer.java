@@ -6,6 +6,7 @@ import fr.esgi.kafka.dispatch.common.JsonSerdes;
 import fr.esgi.kafka.dispatch.common.ValidationOutcome;
 import fr.esgi.kafka.dispatch.model.DriverLocation;
 import fr.esgi.kafka.dispatch.model.RideRequest;
+import fr.esgi.kafka.dispatch.model.SupplyByZone;
 import fr.esgi.kafka.dispatch.model.TripEvent;
 import fr.esgi.kafka.dispatch.validation.DriverLocationValidation;
 import fr.esgi.kafka.dispatch.validation.RideRequestValidation;
@@ -17,7 +18,10 @@ import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.Topology;
 import org.apache.kafka.streams.kstream.Consumed;
+import org.apache.kafka.streams.kstream.Grouped;
 import org.apache.kafka.streams.kstream.KStream;
+import org.apache.kafka.streams.kstream.KTable;
+import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Produced;
 
 import java.time.Instant;
@@ -72,11 +76,39 @@ public class TopologyProducer {
 
         // DISP-2 - Demande par zone (tumbling 2 min)     -> Topics.DEMAND_BY_ZONE
         // DISP-3 - Offre par zone (KTable des chauffeurs) -> Topics.SUPPLY_BY_ZONE
+        publishSupplyByZone(validDriverLocations);
         // DISP-4 - Surge pricing (demande/offre > 2)     -> Topics.SURGE
         // DISP-5 - Courses anormales (vitesse, duree)    -> Topics.ALERTS_TRIPS
         // DISP-6 (bonus) - API REST Interactive Queries : GET /api/v1/surge/{zone}
 
         return builder.build();
+    }
+
+    /**
+     * DISP-3 - Offre par zone (issue #7). Le flux brut de pings ne peut pas
+     * etre compte tel quel (un chauffeur emet ~1 ping/8s) : on materialise
+     * d'abord la derniere position connue par chauffeur (KTable clee par
+     * driver_id, "latest wins" via toTable()), puis on ne garde que les
+     * chauffeurs AVAILABLE et on re-agrege par zone. C'est le point subtil
+     * du ticket : KTable.groupBy() retire automatiquement l'ancienne
+     * contribution d'un chauffeur (ancienne zone, ou statut plus AVAILABLE)
+     * avant d'ajouter la nouvelle, donc un chauffeur qui change de zone ou
+     * quitte AVAILABLE est decompte de sa zone precedente au lieu de
+     * s'additionner en double.
+     */
+    private void publishSupplyByZone(KStream<String, DriverLocation> validDriverLocations) {
+        KTable<String, DriverLocation> latestLocationByDriver = validDriverLocations
+                .toTable(Materialized.with(Serdes.String(), JsonSerdes.of(DriverLocation.class)));
+
+        KTable<String, Long> supplyByZone = latestLocationByDriver
+                .filter((driverId, location) -> "AVAILABLE".equals(location.status()))
+                .groupBy((driverId, location) -> KeyValue.pair(location.zone(), location),
+                        Grouped.with(Serdes.String(), JsonSerdes.of(DriverLocation.class)))
+                .count(Materialized.with(Serdes.String(), Serdes.Long()));
+
+        supplyByZone.toStream()
+                .mapValues((zone, count) -> JsonSerdes.toJson(new SupplyByZone(zone, count)))
+                .to(Topics.SUPPLY_BY_ZONE, Produced.with(Serdes.String(), Serdes.String()));
     }
 
     /**
