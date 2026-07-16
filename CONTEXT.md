@@ -27,7 +27,7 @@ A trip `END` event whose `trip_id` has no corresponding `START` seen within the 
 ### Marketplace metrics
 
 **Zone**:
-One of 12 fixed geographic areas of Paris (`Z-CHATELET`, `Z-MONTMARTRE`, etc.) — the unit of aggregation for demand, supply, and surge. Assigned upstream by the event source, not computed from lat/lon by this pipeline.
+One of 12 fixed geographic areas of Paris (`Z-CHATELET`, `Z-MONTMARTRE`, etc.) — the unit of aggregation for demand, supply, and surge. Assigned upstream by the event source, not computed from lat/lon by this pipeline, but validated as a closed set at ingestion: a zone string outside the known 12 is an invalid event (unrecognized enum), since it would otherwise create a bogus aggregation key downstream.
 
 **Demand**:
 Count of valid ride requests per zone (by `pickup.zone`), aggregated over 2-minute tumbling windows.
@@ -41,3 +41,12 @@ The condition where a zone's demand exceeds available supply by more than 2x (`d
 
 **Ghost trip**:
 A completed trip (`END` event) whose computed average speed (`distance_km / (duration_seconds / 3600)`) exceeds 130 km/h, or whose `duration_seconds` exceeds 10800 (3h) — a suspected fraud pattern, not a data-quality defect.
+
+## Testing locally
+
+The shared cluster used for real grading isn't reachable from a dev box, but a same-shape local run is: `docker-compose.yml` at the repo root brings up the same 3-broker KRaft cluster (Kafbat UI on `:8080`, bootstrap on `localhost:29092`), and `data/raw/*.jsonl` is a vendored copy of the course's real generated traffic for the three input topics (~192k messages, ~7% anomalies, one line per message as `{key, value, ts_ms}`).
+
+1. `docker compose up -d`, then create the three input topics (the Quarkus Kafka Streams extension refuses to start until `quarkus.kafka-streams.topics` all exist) — either through Kafbat UI or `kafka-topics.sh --create`.
+2. Build and run as a packaged jar, **not** `mvn quarkus:dev`: dev mode's Dev Services tries to auto-launch its own Kafka container because it only recognizes the plain `kafka.bootstrap.servers` property, not this project's `quarkus.kafka-streams.bootstrap-servers` — it'll fail trying to reach Docker instead of using the cluster you just started. Use `mvn package -DskipTests` then `GROUPE=<groupe> KAFKA_BOOTSTRAP=localhost:29092 java -jar target/quarkus-app/quarkus-run.jar`.
+3. Replay realistic traffic instead of hand-crafting messages: `scripts/rejouer.py` (vendored from the course's generator toolkit; needs `pip install -r scripts/requirements.txt`) merges `data/raw/*.jsonl` chronologically and produces it to Kafka, topic name taken from each file's basename. `python scripts/rejouer.py --dossier data/raw --bootstrap localhost:29092` pushes all ~192k messages in a few seconds ("as fast as possible" mode — pass `--speed 1` for real-time pacing instead).
+4. Verify: `kafka-consumer-groups.sh --describe --group dispatch-<groupe>` should settle at zero lag on all three input topics (proves every message was consumed, not just accepted); `kafka-console-consumer.sh --topic <groupe>.dispatch.dlq --from-beginning` should show one JSON envelope per rejected message with a specific `reason` — never a generic or missing one.

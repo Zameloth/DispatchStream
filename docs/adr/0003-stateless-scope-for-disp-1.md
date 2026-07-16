@@ -1,0 +1,5 @@
+# Stateless scope for DISP-1
+
+`CONTEXT.md` defines four categories of invalid event — structural/semantic breakage, **late**, **duplicate**, and **conflicting**/**orphan END** — but the last three all require memory across messages (a dedup store, a last-known-location store, a START-tracking store). DISP-1's own acceptance criteria ("10 min sans crash ; DLQ motivée ; aucun message valide perdu") describe a pure parse-and-validate pipeline. We chose to scope DISP-1 to the **stateless** checks only — required fields, types, GPS bounds, enums, timestamp-parseable — and defer late/duplicate/conflicting/orphan-END detection to a later pass.
+
+The trade-off: the mandatory 8-point socle ships without touching state stores, keeping "never crash" easy to guarantee on the first ticket. Late/duplicate/conflicting/orphan-END detection can piggyback on the state store infrastructure DISP-2/3 already need to build, rather than introducing it early. Until that later pass lands, late and duplicate events will pass DISP-1's validation and flow downstream as valid.
