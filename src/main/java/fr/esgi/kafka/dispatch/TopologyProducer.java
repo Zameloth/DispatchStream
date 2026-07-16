@@ -11,6 +11,9 @@ import fr.esgi.kafka.dispatch.model.RideRequest;
 import fr.esgi.kafka.dispatch.model.SupplyByZone;
 import fr.esgi.kafka.dispatch.model.SurgeEvent;
 import fr.esgi.kafka.dispatch.model.TripEvent;
+import fr.esgi.kafka.dispatch.stateful.DriverLocationStatefulValidation;
+import fr.esgi.kafka.dispatch.stateful.RideRequestStatefulValidation;
+import fr.esgi.kafka.dispatch.stateful.TripEventStatefulValidation;
 import fr.esgi.kafka.dispatch.validation.DriverLocationValidation;
 import fr.esgi.kafka.dispatch.validation.RideRequestValidation;
 import fr.esgi.kafka.dispatch.validation.TripEventValidation;
@@ -30,6 +33,7 @@ import org.apache.kafka.streams.kstream.Produced;
 import org.apache.kafka.streams.kstream.Repartitioned;
 import org.apache.kafka.streams.kstream.TimeWindows;
 import org.apache.kafka.streams.kstream.Windowed;
+import org.apache.kafka.streams.processor.api.FixedKeyProcessorSupplier;
 import org.apache.kafka.streams.state.KeyValueStore;
 
 import java.time.Duration;
@@ -53,6 +57,9 @@ public class TopologyProducer {
     @Produces
     public Topology buildTopology() {
         StreamsBuilder builder = new StreamsBuilder();
+        builder.addStateStore(RideRequestStatefulValidation.STORE_BUILDER);
+        builder.addStateStore(DriverLocationStatefulValidation.STORE_BUILDER);
+        builder.addStateStore(TripEventStatefulValidation.STORE_BUILDER);
 
         KStream<String, String> rawRequests = builder.stream(
                 Topics.RIDE_REQUESTS,
@@ -74,20 +81,32 @@ public class TopologyProducer {
         //   Meme parse deux-phases + chaine de regles metier a court-circuit
         //   pour les trois flux (cf. common.EventValidator, ADR 0004),
         //   regles propres a chaque type dans validation.*Validation.
+        //
+        //   Deuxieme etape stateful (late/duplicate/conflicting/orphan-END,
+        //   ADR 0007, completant ADR 0003) : processValues() sur le flux
+        //   deja structurellement valide, un store par flux keye par son
+        //   identite propre (cf. CONTEXT.md "Duplicate event").
         // -----------------------------------------------------------------
 
         // Flux types, exploites par DISP-2/3/5+ (demande/offre par zone,
         // courses anormales...).
-        KStream<String, RideRequest> validRideRequests = validateAndRouteToDlq(
+        KStream<String, ValidationOutcome.Valid<RideRequest>> structurallyValidRequests = validateAndRouteToDlq(
                 rawRequests, RideRequestValidation.VALIDATOR, Topics.RIDE_REQUESTS);
+        KStream<String, RideRequest> validRideRequests = applyStatefulValidation(
+                structurallyValidRequests, RideRequestStatefulValidation.processorSupplier(),
+                RideRequestStatefulValidation.STORE_NAME, Topics.RIDE_REQUESTS);
 
-        KStream<String, DriverLocation> validDriverLocations = validateAndRouteToDlq(
+        KStream<String, ValidationOutcome.Valid<DriverLocation>> structurallyValidLocations = validateAndRouteToDlq(
                 rawLocations, DriverLocationValidation.VALIDATOR, Topics.DRIVER_LOCATIONS);
+        KStream<String, DriverLocation> validDriverLocations = applyStatefulValidation(
+                structurallyValidLocations, DriverLocationStatefulValidation.processorSupplier(),
+                DriverLocationStatefulValidation.STORE_NAME, Topics.DRIVER_LOCATIONS);
 
-        // Correlation START/END (orphan END) hors-perimetre ici,
-        // cf. ADR 0003 / TripEventValidation.
-        KStream<String, TripEvent> validTripEvents = validateAndRouteToDlq(
+        KStream<String, ValidationOutcome.Valid<TripEvent>> structurallyValidTrips = validateAndRouteToDlq(
                 rawTrips, TripEventValidation.VALIDATOR, Topics.TRIP_EVENTS);
+        KStream<String, TripEvent> validTripEvents = applyStatefulValidation(
+                structurallyValidTrips, TripEventStatefulValidation.processorSupplier(),
+                TripEventStatefulValidation.STORE_NAME, Topics.TRIP_EVENTS);
 
         // DISP-2 - Demande par zone (tumbling 2 min)     -> Topics.DEMAND_BY_ZONE
         KTable<Windowed<String>, Long> demandByZone = buildDemandByZone(validRideRequests);
@@ -213,20 +232,48 @@ public class TopologyProducer {
     }
 
     /**
-     * Valide un flux brut via un EventValidator et le scinde en deux :
-     * le flux type des messages valides (retourne, exploite par les
-     * tickets suivants) et le flux des invalides, routes vers Topics.DLQ
-     * sous forme de DlqEnvelope (cf. ADR 0004). Factorise le cablage
-     * commun aux trois flux d'entree (issues #2/#3/#4).
+     * Valide un flux brut via un EventValidator, en conservant le message
+     * original (ValidationOutcome.Valid#raw()) pour l'etape stateful
+     * suivante qui peut encore router vers la DLQ (cf. applyStatefulValidation,
+     * ADR 0007). Factorise le cablage commun aux trois flux d'entree
+     * (issues #2/#3/#4).
      */
-    private <T> KStream<String, T> validateAndRouteToDlq(
+    private <T> KStream<String, ValidationOutcome.Valid<T>> validateAndRouteToDlq(
             KStream<String, String> raw, EventValidator<T> validator, String sourceTopic) {
 
         KStream<String, ValidationOutcome<T>> outcomes = raw.mapValues(validator::validate);
+        return routeOutcomesToDlq(outcomes, sourceTopic);
+    }
 
-        KStream<String, T> valid = outcomes
+    /**
+     * Deuxieme etape de validation, stateful (late/duplicate/conflicting/
+     * orphan-END, ADR 0007) : ne s'execute que sur le flux deja
+     * structurellement valide (raw preserve), via processValues() et le
+     * store attache au processor fourni. Reutilise routeOutcomesToDlq
+     * pour rester coherent avec la premiere etape (meme DlqEnvelope, ADR 0004).
+     */
+    private <T> KStream<String, T> applyStatefulValidation(
+            KStream<String, ValidationOutcome.Valid<T>> structurallyValid,
+            FixedKeyProcessorSupplier<String, ValidationOutcome.Valid<T>, ValidationOutcome<T>> supplier,
+            String storeName, String sourceTopic) {
+
+        KStream<String, ValidationOutcome<T>> outcomes = structurallyValid.processValues(supplier, storeName);
+        return routeOutcomesToDlq(outcomes, sourceTopic).mapValues(ValidationOutcome.Valid::value);
+    }
+
+    /**
+     * Scinde un flux de ValidationOutcome en deux : le flux des messages
+     * valides (retourne, raw conserve pour une eventuelle etape suivante)
+     * et le flux des invalides, routes vers Topics.DLQ sous forme de
+     * DlqEnvelope (cf. ADR 0004). Partage par les deux etapes de
+     * validation (stateless et stateful, ADR 0007).
+     */
+    private <T> KStream<String, ValidationOutcome.Valid<T>> routeOutcomesToDlq(
+            KStream<String, ValidationOutcome<T>> outcomes, String sourceTopic) {
+
+        KStream<String, ValidationOutcome.Valid<T>> valid = outcomes
                 .filter((key, outcome) -> outcome instanceof ValidationOutcome.Valid<T>)
-                .mapValues(outcome -> ((ValidationOutcome.Valid<T>) outcome).value());
+                .mapValues(outcome -> (ValidationOutcome.Valid<T>) outcome);
 
         outcomes
                 .filter((key, outcome) -> outcome instanceof ValidationOutcome.Invalid<T>)

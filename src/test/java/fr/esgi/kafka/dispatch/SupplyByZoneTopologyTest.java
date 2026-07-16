@@ -13,6 +13,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Properties;
 
@@ -65,7 +66,9 @@ class SupplyByZoneTopologyTest {
                   "timestamp": "%s"
                 }
                 """.formatted(driverId, zone, status, timestamp);
-        driverLocationsIn.pipeInput(driverId, raw);
+        // Timestamp du record aligne sur le timestamp metier : ce test ne
+        // porte pas sur la detection de retard (cf. Timestamps.isLate, ADR 0007).
+        driverLocationsIn.pipeInput(driverId, raw, Instant.parse(timestamp));
     }
 
     /**

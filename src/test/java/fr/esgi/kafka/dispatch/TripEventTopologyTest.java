@@ -12,6 +12,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -99,13 +100,30 @@ class TripEventTopologyTest {
                 }
                 """;
 
-        tripEventsIn.pipeInput("trip-1", raw);
+        // Timestamp du record aligne sur le timestamp metier : ce test
+        // porte sur la validation stateless, pas sur la detection de
+        // retard (cf. Timestamps.isLate, ADR 0007).
+        tripEventsIn.pipeInput("trip-1", raw, Instant.parse("2026-07-16T10:00:00Z"));
 
         assertTrue(dlqOut.isEmpty());
     }
 
     @Test
     void wellFormedEndTripEventDoesNotReachTheDlq() {
+        // START prealable requis (meme trip_id, dans la fenetre de 6 min) :
+        // depuis ADR 0007, un END sans START correspondant est rejete
+        // (orphan-END, cf. orphanEndTripEventIsRoutedToDlq).
+        String start = """
+                {
+                  "trip_id": "trip-1",
+                  "driver_id": "drv-1",
+                  "user_id": "u-1",
+                  "event": "START",
+                  "timestamp": "2026-07-16T10:10:00Z"
+                }
+                """;
+        tripEventsIn.pipeInput("trip-1", start, Instant.parse("2026-07-16T10:10:00Z"));
+
         String raw = """
                 {
                   "trip_id": "trip-1",
@@ -118,16 +136,16 @@ class TripEventTopologyTest {
                 }
                 """;
 
-        tripEventsIn.pipeInput("trip-1", raw);
+        tripEventsIn.pipeInput("trip-1", raw, Instant.parse("2026-07-16T10:12:00Z"));
 
         assertTrue(dlqOut.isEmpty());
     }
 
     @Test
-    void orphanEndTripEventDoesNotReachTheDlq() {
-        // Aucun START prealable pour trip-orphan dans ce test : la
-        // correlation START/END est hors-perimetre (cf. ADR 0003), un END
-        // bien forme doit passer meme sans START correspondant.
+    void orphanEndTripEventIsRoutedToDlq() throws Exception {
+        // Aucun START prealable pour trip-orphan dans ce test : depuis
+        // ADR 0007 (completant ADR 0003), un END sans START correspondant
+        // dans la fenetre de 6 min est invalide.
         String raw = """
                 {
                   "trip_id": "trip-orphan",
@@ -140,8 +158,10 @@ class TripEventTopologyTest {
                 }
                 """;
 
-        tripEventsIn.pipeInput("trip-orphan", raw);
+        tripEventsIn.pipeInput("trip-orphan", raw, Instant.parse("2026-07-16T10:12:00Z"));
 
-        assertTrue(dlqOut.isEmpty());
+        DlqEnvelope envelope = MAPPER.readValue(dlqOut.readValue(), DlqEnvelope.class);
+        assertEquals("no matching START for trip_id", envelope.reason());
+        assertEquals(raw, envelope.rawValue());
     }
 }

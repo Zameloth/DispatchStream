@@ -13,8 +13,9 @@ import java.util.Set;
  * dispatch.trip.events), appliquees par EventValidator apres le parsing
  * generique en deux phases (cf. ADR 0004). Portee volontairement sans
  * etat (cf. ADR 0003) : la correlation d'un END avec un START anterieur
- * (detection des "orphan END") est explicitement hors-perimetre de cette
- * validation et deferree a un ticket ulterieur.
+ * (detection des "orphan END") est hors-perimetre de cette classe,
+ * geree par la deuxieme etape stateful du pipeline
+ * (cf. stateful.TripEventStatefulValidation, ADR 0007).
  */
 public final class TripEventValidation {
 

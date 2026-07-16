@@ -12,6 +12,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -55,6 +56,12 @@ class GhostTripTopologyTest {
         driver.close();
     }
 
+    // START 4 min avant END, dans la fenetre de 6 min (ADR 0007) : sinon
+    // le END serait rejete en amont comme orphan-END avant meme d'atteindre
+    // la detection ghost trip.
+    private static final Instant START_TS = Instant.parse("2026-07-16T10:08:00Z");
+    private static final Instant END_TS = Instant.parse("2026-07-16T10:12:00Z");
+
     private void end(String tripId, double distanceKm, int durationSeconds) {
         String raw = """
                 {
@@ -64,10 +71,10 @@ class GhostTripTopologyTest {
                   "event": "END",
                   "distance_km": %s,
                   "duration_seconds": %d,
-                  "timestamp": "2026-07-16T10:12:00Z"
+                  "timestamp": "%s"
                 }
-                """.formatted(tripId, distanceKm, durationSeconds);
-        tripEventsIn.pipeInput(tripId, raw);
+                """.formatted(tripId, distanceKm, durationSeconds, END_TS);
+        tripEventsIn.pipeInput(tripId, raw, END_TS);
     }
 
     private void start(String tripId) {
@@ -77,10 +84,10 @@ class GhostTripTopologyTest {
                   "driver_id": "drv-1",
                   "user_id": "u-1",
                   "event": "START",
-                  "timestamp": "2026-07-16T10:00:00Z"
+                  "timestamp": "%s"
                 }
-                """.formatted(tripId);
-        tripEventsIn.pipeInput(tripId, raw);
+                """.formatted(tripId, START_TS);
+        tripEventsIn.pipeInput(tripId, raw, START_TS);
     }
 
     @Test
@@ -92,6 +99,7 @@ class GhostTripTopologyTest {
 
     @Test
     void endWithAverageSpeedAbove130KmhIsFlaggedAsSpeedBased() throws Exception {
+        start("trip-1");
         // 100 km en 1200 s (20 min) = 300 km/h.
         end("trip-1", 100.0, 1200);
 
@@ -102,6 +110,7 @@ class GhostTripTopologyTest {
 
     @Test
     void endWithDurationAbove3HoursIsFlaggedAsDurationBased() throws Exception {
+        start("trip-1");
         // 20 km en 10801 s (~3h) = vitesse moyenne normale, seule la duree deborde.
         end("trip-1", 20.0, 10_801);
 
@@ -112,6 +121,9 @@ class GhostTripTopologyTest {
 
     @Test
     void normalTripsInTheFifteenToFortyKmhRangeNeverTriggerAFalsePositive() {
+        start("trip-1");
+        start("trip-2");
+        start("trip-3");
         end("trip-1", 5.0, 1200);  // 15 km/h
         end("trip-2", 10.0, 1440); // 25 km/h
         end("trip-3", 15.0, 1350); // 40 km/h
@@ -121,6 +133,7 @@ class GhostTripTopologyTest {
 
     @Test
     void alertIsPublishedToTheAlertsTripsTopic() {
+        start("trip-1");
         end("trip-1", 900.0, 1200);
 
         assertTrue(!alertsOut.isEmpty());

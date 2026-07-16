@@ -13,6 +13,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -68,7 +69,7 @@ class DispatchTopologyTest {
                 }
                 """;
 
-        driverLocationsIn.pipeInput("drv-42", raw);
+        driverLocationsIn.pipeInput("drv-42", raw, Instant.parse("2026-07-04T14:03:21.512Z"));
 
         assertFalse(dlqOut.isEmpty());
         DlqEnvelope envelope = MAPPER.readValue(dlqOut.readValue(), DlqEnvelope.class);
@@ -84,6 +85,20 @@ class DispatchTopologyTest {
         TestOutputTopic<String, String> alertsOut = driver.createOutputTopic(
                 Topics.ALERTS_TRIPS, Serdes.String().deserializer(), Serdes.String().deserializer());
 
+        // START prealable requis (meme trip_id, dans la fenetre de 6 min) :
+        // depuis ADR 0007, un END sans START correspondant est rejete
+        // (orphan-END) avant meme d'atteindre la detection ghost trip.
+        String start = """
+                {
+                  "trip_id": "trip-fantome",
+                  "driver_id": "drv-1",
+                  "user_id": "u-1",
+                  "event": "START",
+                  "timestamp": "2026-07-16T10:10:00Z"
+                }
+                """;
+        tripEventsIn.pipeInput("trip-fantome", start, Instant.parse("2026-07-16T10:10:00Z"));
+
         // 900 km parcourus en 1200 s (20 min) : ~2700 km/h, tres au-dela du
         // seuil de 130 km/h (cf. CONTEXT.md "Ghost trip").
         String raw = """
@@ -98,7 +113,7 @@ class DispatchTopologyTest {
                 }
                 """;
 
-        tripEventsIn.pipeInput("trip-fantome", raw);
+        tripEventsIn.pipeInput("trip-fantome", raw, Instant.parse("2026-07-16T10:12:00Z"));
 
         assertFalse(alertsOut.isEmpty());
         GhostTripAlert alert = MAPPER.readValue(alertsOut.readValue(), GhostTripAlert.class);

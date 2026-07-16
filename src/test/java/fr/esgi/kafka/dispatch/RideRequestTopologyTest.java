@@ -12,6 +12,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -116,7 +117,10 @@ class RideRequestTopologyTest {
                 }
                 """;
 
-        rideRequestsIn.pipeInput("u-0278", raw);
+        // Timestamp du record aligne sur le timestamp metier : ce test
+        // porte sur la validation stateless, pas sur la detection de
+        // retard (cf. Timestamps.isLate, ADR 0007).
+        rideRequestsIn.pipeInput("u-0278", raw, Instant.parse("2026-07-04T14:03:21.512Z"));
 
         assertTrue(dlqOut.isEmpty());
     }
