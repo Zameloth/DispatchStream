@@ -4,6 +4,7 @@ import fr.esgi.kafka.dispatch.common.DlqEnvelope;
 import fr.esgi.kafka.dispatch.common.EventValidator;
 import fr.esgi.kafka.dispatch.common.JsonSerdes;
 import fr.esgi.kafka.dispatch.common.ValidationOutcome;
+import fr.esgi.kafka.dispatch.model.DemandByZone;
 import fr.esgi.kafka.dispatch.model.DriverLocation;
 import fr.esgi.kafka.dispatch.model.RideRequest;
 import fr.esgi.kafka.dispatch.model.TripEvent;
@@ -17,9 +18,15 @@ import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.Topology;
 import org.apache.kafka.streams.kstream.Consumed;
+import org.apache.kafka.streams.kstream.Grouped;
 import org.apache.kafka.streams.kstream.KStream;
+import org.apache.kafka.streams.kstream.KTable;
+import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Produced;
+import org.apache.kafka.streams.kstream.TimeWindows;
+import org.apache.kafka.streams.kstream.Windowed;
 
+import java.time.Duration;
 import java.time.Instant;
 
 /**
@@ -71,12 +78,41 @@ public class TopologyProducer {
                 rawTrips, TripEventValidation.VALIDATOR, Topics.TRIP_EVENTS);
 
         // DISP-2 - Demande par zone (tumbling 2 min)     -> Topics.DEMAND_BY_ZONE
+        buildDemandByZone(validRideRequests);
+
         // DISP-3 - Offre par zone (KTable des chauffeurs) -> Topics.SUPPLY_BY_ZONE
         // DISP-4 - Surge pricing (demande/offre > 2)     -> Topics.SURGE
         // DISP-5 - Courses anormales (vitesse, duree)    -> Topics.ALERTS_TRIPS
         // DISP-6 (bonus) - API REST Interactive Queries : GET /api/v1/surge/{zone}
 
         return builder.build();
+    }
+
+    /**
+     * DISP-2 (issue #6) : compte les demandes de course par pickup.zone
+     * (pas par la cle du record, qui est user_id) sur des fenetres
+     * tumbling de 2 min avec 6 min de grace (meme seuil que le retard
+     * accepte en validation, cf. CONTEXT.md). Pas de suppress() : chaque
+     * mise a jour du compte est publiee des qu'elle arrive (ADR 0001),
+     * pour que DISP-4 reagisse a une rafale pendant qu'elle se produit.
+     */
+    private void buildDemandByZone(KStream<String, RideRequest> validRideRequests) {
+        KTable<Windowed<String>, Long> demandByZone = validRideRequests
+                .groupBy((key, request) -> request.pickup().zone(),
+                        Grouped.with(Serdes.String(), JsonSerdes.of(RideRequest.class)))
+                .windowedBy(TimeWindows.ofSizeAndGrace(Duration.ofMinutes(2), Duration.ofMinutes(6)))
+                .count(Materialized.with(Serdes.String(), Serdes.Long()));
+
+        demandByZone.toStream()
+                .map((windowedZone, count) -> {
+                    DemandByZone demand = new DemandByZone(
+                            windowedZone.key(),
+                            Instant.ofEpochMilli(windowedZone.window().start()).toString(),
+                            Instant.ofEpochMilli(windowedZone.window().end()).toString(),
+                            count);
+                    return KeyValue.pair(windowedZone.key(), JsonSerdes.toJson(demand));
+                })
+                .to(Topics.DEMAND_BY_ZONE, Produced.with(Serdes.String(), Serdes.String()));
     }
 
     /**
