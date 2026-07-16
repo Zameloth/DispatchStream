@@ -3,7 +3,9 @@ package fr.esgi.kafka.dispatch;
 import fr.esgi.kafka.dispatch.common.DlqEnvelope;
 import fr.esgi.kafka.dispatch.common.JsonSerdes;
 import fr.esgi.kafka.dispatch.common.ValidationOutcome;
+import fr.esgi.kafka.dispatch.model.DriverLocation;
 import fr.esgi.kafka.dispatch.model.RideRequest;
+import fr.esgi.kafka.dispatch.validation.DriverLocationValidation;
 import fr.esgi.kafka.dispatch.validation.RideRequestValidation;
 import io.quarkus.logging.Log;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -73,6 +75,30 @@ public class TopologyProducer {
                             (ValidationOutcome.Invalid<RideRequest>) outcome;
                     DlqEnvelope envelope = new DlqEnvelope(
                             Topics.RIDE_REQUESTS, key, invalid.raw(), invalid.reason(),
+                            Instant.now().toString());
+                    return KeyValue.pair(key, JsonSerdes.toJson(envelope));
+                })
+                .to(Topics.DLQ, Produced.with(Serdes.String(), Serdes.String()));
+
+        // dispatch.driver.locations : meme parse deux-phases + chaine de
+        // regles metier a court-circuit (cf. common.EventValidator, ADR
+        // 0004), regles propres a DriverLocation dans
+        // validation.DriverLocationValidation.
+        KStream<String, ValidationOutcome<DriverLocation>> driverLocationOutcomes =
+                rawLocations.mapValues(DriverLocationValidation.VALIDATOR::validate);
+
+        // Flux type, exploite par DISP-3+ (offre par zone...).
+        KStream<String, DriverLocation> validDriverLocations = driverLocationOutcomes
+                .filter((key, outcome) -> outcome instanceof ValidationOutcome.Valid<DriverLocation>)
+                .mapValues(outcome -> ((ValidationOutcome.Valid<DriverLocation>) outcome).value());
+
+        driverLocationOutcomes
+                .filter((key, outcome) -> outcome instanceof ValidationOutcome.Invalid<DriverLocation>)
+                .map((key, outcome) -> {
+                    ValidationOutcome.Invalid<DriverLocation> invalid =
+                            (ValidationOutcome.Invalid<DriverLocation>) outcome;
+                    DlqEnvelope envelope = new DlqEnvelope(
+                            Topics.DRIVER_LOCATIONS, key, invalid.raw(), invalid.reason(),
                             Instant.now().toString());
                     return KeyValue.pair(key, JsonSerdes.toJson(envelope));
                 })
