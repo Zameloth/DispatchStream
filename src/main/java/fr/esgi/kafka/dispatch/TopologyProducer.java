@@ -4,6 +4,7 @@ import fr.esgi.kafka.dispatch.common.DlqEnvelope;
 import fr.esgi.kafka.dispatch.common.EventValidator;
 import fr.esgi.kafka.dispatch.common.JsonSerdes;
 import fr.esgi.kafka.dispatch.common.ValidationOutcome;
+import fr.esgi.kafka.dispatch.model.DemandByZone;
 import fr.esgi.kafka.dispatch.model.DriverLocation;
 import fr.esgi.kafka.dispatch.model.RideRequest;
 import fr.esgi.kafka.dispatch.model.SupplyByZone;
@@ -23,7 +24,10 @@ import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.KTable;
 import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Produced;
+import org.apache.kafka.streams.kstream.TimeWindows;
+import org.apache.kafka.streams.kstream.Windowed;
 
+import java.time.Duration;
 import java.time.Instant;
 
 /**
@@ -75,6 +79,8 @@ public class TopologyProducer {
                 rawTrips, TripEventValidation.VALIDATOR, Topics.TRIP_EVENTS);
 
         // DISP-2 - Demande par zone (tumbling 2 min)     -> Topics.DEMAND_BY_ZONE
+        buildDemandByZone(validRideRequests);
+
         // DISP-3 - Offre par zone (KTable des chauffeurs) -> Topics.SUPPLY_BY_ZONE
         publishSupplyByZone(validDriverLocations);
         // DISP-4 - Surge pricing (demande/offre > 2)     -> Topics.SURGE
@@ -85,30 +91,30 @@ public class TopologyProducer {
     }
 
     /**
-     * DISP-3 - Offre par zone (issue #7). Le flux brut de pings ne peut pas
-     * etre compte tel quel (un chauffeur emet ~1 ping/8s) : on materialise
-     * d'abord la derniere position connue par chauffeur (KTable clee par
-     * driver_id, "latest wins" via toTable()), puis on ne garde que les
-     * chauffeurs AVAILABLE et on re-agrege par zone. C'est le point subtil
-     * du ticket : KTable.groupBy() retire automatiquement l'ancienne
-     * contribution d'un chauffeur (ancienne zone, ou statut plus AVAILABLE)
-     * avant d'ajouter la nouvelle, donc un chauffeur qui change de zone ou
-     * quitte AVAILABLE est decompte de sa zone precedente au lieu de
-     * s'additionner en double.
+     * DISP-2 (issue #6) : compte les demandes de course par pickup.zone
+     * (pas par la cle du record, qui est user_id) sur des fenetres
+     * tumbling de 2 min avec 6 min de grace (meme seuil que le retard
+     * accepte en validation, cf. CONTEXT.md). Pas de suppress() : chaque
+     * mise a jour du compte est publiee des qu'elle arrive (ADR 0001),
+     * pour que DISP-4 reagisse a une rafale pendant qu'elle se produit.
      */
-    private void publishSupplyByZone(KStream<String, DriverLocation> validDriverLocations) {
-        KTable<String, DriverLocation> latestLocationByDriver = validDriverLocations
-                .toTable(Materialized.with(Serdes.String(), JsonSerdes.of(DriverLocation.class)));
-
-        KTable<String, Long> supplyByZone = latestLocationByDriver
-                .filter((driverId, location) -> "AVAILABLE".equals(location.status()))
-                .groupBy((driverId, location) -> KeyValue.pair(location.zone(), location),
-                        Grouped.with(Serdes.String(), JsonSerdes.of(DriverLocation.class)))
+    private void buildDemandByZone(KStream<String, RideRequest> validRideRequests) {
+        KTable<Windowed<String>, Long> demandByZone = validRideRequests
+                .groupBy((key, request) -> request.pickup().zone(),
+                        Grouped.with(Serdes.String(), JsonSerdes.of(RideRequest.class)))
+                .windowedBy(TimeWindows.ofSizeAndGrace(Duration.ofMinutes(2), Duration.ofMinutes(6)))
                 .count(Materialized.with(Serdes.String(), Serdes.Long()));
 
-        supplyByZone.toStream()
-                .mapValues((zone, count) -> JsonSerdes.toJson(new SupplyByZone(zone, count)))
-                .to(Topics.SUPPLY_BY_ZONE, Produced.with(Serdes.String(), Serdes.String()));
+        demandByZone.toStream()
+                .map((windowedZone, count) -> {
+                    DemandByZone demand = new DemandByZone(
+                            windowedZone.key(),
+                            Instant.ofEpochMilli(windowedZone.window().start()).toString(),
+                            Instant.ofEpochMilli(windowedZone.window().end()).toString(),
+                            count);
+                    return KeyValue.pair(windowedZone.key(), JsonSerdes.toJson(demand));
+                })
+                .to(Topics.DEMAND_BY_ZONE, Produced.with(Serdes.String(), Serdes.String()));
     }
 
     /**
