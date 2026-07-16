@@ -57,6 +57,13 @@
       <artifactId>rest-assured</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- TopologyTestDriver pour tester la topologie sans broker (bonus tests). -->
+    <dependency>
+      <groupId>org.apache.kafka</groupId>
+      <artifactId>kafka-streams-test-utils</artifactId>
+      <version>3.9.0</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
