@@ -5,8 +5,10 @@ import fr.esgi.kafka.dispatch.common.JsonSerdes;
 import fr.esgi.kafka.dispatch.common.ValidationOutcome;
 import fr.esgi.kafka.dispatch.model.DriverLocation;
 import fr.esgi.kafka.dispatch.model.RideRequest;
+import fr.esgi.kafka.dispatch.model.TripEvent;
 import fr.esgi.kafka.dispatch.validation.DriverLocationValidation;
 import fr.esgi.kafka.dispatch.validation.RideRequestValidation;
+import fr.esgi.kafka.dispatch.validation.TripEventValidation;
 import io.quarkus.logging.Log;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Produces;
@@ -99,6 +101,30 @@ public class TopologyProducer {
                             (ValidationOutcome.Invalid<DriverLocation>) outcome;
                     DlqEnvelope envelope = new DlqEnvelope(
                             Topics.DRIVER_LOCATIONS, key, invalid.raw(), invalid.reason(),
+                            Instant.now().toString());
+                    return KeyValue.pair(key, JsonSerdes.toJson(envelope));
+                })
+                .to(Topics.DLQ, Produced.with(Serdes.String(), Serdes.String()));
+
+        // dispatch.trip.events : meme parse deux-phases + chaine de regles
+        // metier a court-circuit, regles propres a TripEvent dans
+        // validation.TripEventValidation. Correlation START/END (orphan
+        // END) hors-perimetre ici, cf. ADR 0003 / TripEventValidation.
+        KStream<String, ValidationOutcome<TripEvent>> tripEventOutcomes =
+                rawTrips.mapValues(TripEventValidation.VALIDATOR::validate);
+
+        // Flux type, exploite par DISP-5 (courses anormales...).
+        KStream<String, TripEvent> validTripEvents = tripEventOutcomes
+                .filter((key, outcome) -> outcome instanceof ValidationOutcome.Valid<TripEvent>)
+                .mapValues(outcome -> ((ValidationOutcome.Valid<TripEvent>) outcome).value());
+
+        tripEventOutcomes
+                .filter((key, outcome) -> outcome instanceof ValidationOutcome.Invalid<TripEvent>)
+                .map((key, outcome) -> {
+                    ValidationOutcome.Invalid<TripEvent> invalid =
+                            (ValidationOutcome.Invalid<TripEvent>) outcome;
+                    DlqEnvelope envelope = new DlqEnvelope(
+                            Topics.TRIP_EVENTS, key, invalid.raw(), invalid.reason(),
                             Instant.now().toString());
                     return KeyValue.pair(key, JsonSerdes.toJson(envelope));
                 })
