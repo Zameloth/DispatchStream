@@ -47,6 +47,9 @@ public class TopologyProducer {
     /** Nom du state store queryable du ratio de surge, lu par DISP-6 (bonus, issue #10). */
     public static final String SURGE_RATIO_STORE = "surge-ratio-by-zone-store";
 
+    /** Seuil de surge (CONTEXT.md "Surge") : partage avec SurgeResource (issue #10) pour eviter de dupliquer le nombre magique. */
+    public static final double SURGE_THRESHOLD = 2.0;
+
     @Produces
     public Topology buildTopology() {
         StreamsBuilder builder = new StreamsBuilder();
@@ -188,7 +191,7 @@ public class TopologyProducer {
                         .withValueSerde(Serdes.Double()));
 
         surgeRatioByZone.toStream()
-                .filter((zone, ratio) -> ratio > 2.0)
+                .filter((zone, ratio) -> ratio > SURGE_THRESHOLD)
                 .mapValues((zone, ratio) -> JsonSerdes.toJson(new SurgeEvent(zone, ratio)))
                 .to(Topics.SURGE, Produced.with(Serdes.String(), Serdes.String()));
     }
