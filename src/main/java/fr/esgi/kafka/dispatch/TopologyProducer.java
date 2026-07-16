@@ -118,6 +118,33 @@ public class TopologyProducer {
     }
 
     /**
+     * DISP-3 - Offre par zone (issue #7). Le flux brut de pings ne peut pas
+     * etre compte tel quel (un chauffeur emet ~1 ping/8s) : on materialise
+     * d'abord la derniere position connue par chauffeur (KTable clee par
+     * driver_id, "latest wins" via toTable()), puis on ne garde que les
+     * chauffeurs AVAILABLE et on re-agrege par zone. C'est le point subtil
+     * du ticket : KTable.groupBy() retire automatiquement l'ancienne
+     * contribution d'un chauffeur (ancienne zone, ou statut plus AVAILABLE)
+     * avant d'ajouter la nouvelle, donc un chauffeur qui change de zone ou
+     * quitte AVAILABLE est decompte de sa zone precedente au lieu de
+     * s'additionner en double.
+     */
+    private void publishSupplyByZone(KStream<String, DriverLocation> validDriverLocations) {
+        KTable<String, DriverLocation> latestLocationByDriver = validDriverLocations
+                .toTable(Materialized.with(Serdes.String(), JsonSerdes.of(DriverLocation.class)));
+
+        KTable<String, Long> supplyByZone = latestLocationByDriver
+                .filter((driverId, location) -> "AVAILABLE".equals(location.status()))
+                .groupBy((driverId, location) -> KeyValue.pair(location.zone(), location),
+                        Grouped.with(Serdes.String(), JsonSerdes.of(DriverLocation.class)))
+                .count(Materialized.with(Serdes.String(), Serdes.Long()));
+
+        supplyByZone.toStream()
+                .mapValues((zone, count) -> JsonSerdes.toJson(new SupplyByZone(zone, count)))
+                .to(Topics.SUPPLY_BY_ZONE, Produced.with(Serdes.String(), Serdes.String()));
+    }
+
+    /**
      * Valide un flux brut via un EventValidator et le scinde en deux :
      * le flux type des messages valides (retourne, exploite par les
      * tickets suivants) et le flux des invalides, routes vers Topics.DLQ
