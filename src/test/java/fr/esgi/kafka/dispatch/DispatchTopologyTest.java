@@ -2,6 +2,7 @@ package fr.esgi.kafka.dispatch;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import fr.esgi.kafka.dispatch.common.DlqEnvelope;
+import fr.esgi.kafka.dispatch.model.GhostTripAlert;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.TestInputTopic;
@@ -10,7 +11,6 @@ import org.apache.kafka.streams.Topology;
 import org.apache.kafka.streams.TopologyTestDriver;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import java.util.Properties;
@@ -78,7 +78,31 @@ class DispatchTopologyTest {
     }
 
     @Test
-    @Disabled("A implementer : une course a 900 km/h doit lever une alerte")
-    void courseAberranteDeclencheUneAlerte() {
+    void courseAberranteDeclencheUneAlerte() throws Exception {
+        TestInputTopic<String, String> tripEventsIn = driver.createInputTopic(
+                Topics.TRIP_EVENTS, Serdes.String().serializer(), Serdes.String().serializer());
+        TestOutputTopic<String, String> alertsOut = driver.createOutputTopic(
+                Topics.ALERTS_TRIPS, Serdes.String().deserializer(), Serdes.String().deserializer());
+
+        // 900 km parcourus en 1200 s (20 min) : ~2700 km/h, tres au-dela du
+        // seuil de 130 km/h (cf. CONTEXT.md "Ghost trip").
+        String raw = """
+                {
+                  "trip_id": "trip-fantome",
+                  "driver_id": "drv-1",
+                  "user_id": "u-1",
+                  "event": "END",
+                  "distance_km": 900.0,
+                  "duration_seconds": 1200,
+                  "timestamp": "2026-07-16T10:12:00Z"
+                }
+                """;
+
+        tripEventsIn.pipeInput("trip-fantome", raw);
+
+        assertFalse(alertsOut.isEmpty());
+        GhostTripAlert alert = MAPPER.readValue(alertsOut.readValue(), GhostTripAlert.class);
+        assertEquals("trip-fantome", alert.tripId());
+        assertEquals("excessive_speed", alert.reason());
     }
 }
