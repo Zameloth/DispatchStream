@@ -8,6 +8,7 @@ import fr.esgi.kafka.dispatch.model.DemandByZone;
 import fr.esgi.kafka.dispatch.model.DriverLocation;
 import fr.esgi.kafka.dispatch.model.RideRequest;
 import fr.esgi.kafka.dispatch.model.SupplyByZone;
+import fr.esgi.kafka.dispatch.model.SurgeEvent;
 import fr.esgi.kafka.dispatch.model.TripEvent;
 import fr.esgi.kafka.dispatch.validation.DriverLocationValidation;
 import fr.esgi.kafka.dispatch.validation.RideRequestValidation;
@@ -15,6 +16,7 @@ import fr.esgi.kafka.dispatch.validation.TripEventValidation;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Produces;
 import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.common.utils.Bytes;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.Topology;
@@ -24,8 +26,10 @@ import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.KTable;
 import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Produced;
+import org.apache.kafka.streams.kstream.Repartitioned;
 import org.apache.kafka.streams.kstream.TimeWindows;
 import org.apache.kafka.streams.kstream.Windowed;
+import org.apache.kafka.streams.state.KeyValueStore;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -38,6 +42,9 @@ import java.time.Instant;
  */
 @ApplicationScoped
 public class TopologyProducer {
+
+    /** Nom du state store queryable du ratio de surge, lu par DISP-6 (bonus, issue #10). */
+    public static final String SURGE_RATIO_STORE = "surge-ratio-by-zone-store";
 
     @Produces
     public Topology buildTopology() {
@@ -79,11 +86,13 @@ public class TopologyProducer {
                 rawTrips, TripEventValidation.VALIDATOR, Topics.TRIP_EVENTS);
 
         // DISP-2 - Demande par zone (tumbling 2 min)     -> Topics.DEMAND_BY_ZONE
-        buildDemandByZone(validRideRequests);
+        KTable<Windowed<String>, Long> demandByZone = buildDemandByZone(validRideRequests);
 
         // DISP-3 - Offre par zone (KTable des chauffeurs) -> Topics.SUPPLY_BY_ZONE
-        publishSupplyByZone(validDriverLocations);
+        KTable<String, Long> supplyByZone = publishSupplyByZone(validDriverLocations);
+
         // DISP-4 - Surge pricing (demande/offre > 2)     -> Topics.SURGE
+        buildSurge(demandByZone, supplyByZone);
         // DISP-5 - Courses anormales (vitesse, duree)    -> Topics.ALERTS_TRIPS
         // DISP-6 (bonus) - API REST Interactive Queries : GET /api/v1/surge/{zone}
 
@@ -97,8 +106,11 @@ public class TopologyProducer {
      * accepte en validation, cf. CONTEXT.md). Pas de suppress() : chaque
      * mise a jour du compte est publiee des qu'elle arrive (ADR 0001),
      * pour que DISP-4 reagisse a une rafale pendant qu'elle se produit.
+     * Retourne la KTable windowee (cle Windowed&lt;String&gt;) pour DISP-4,
+     * qui doit d'abord l'aplatir en cle zone simple avant de la joindre a
+     * l'offre (cf. buildSurge / ADR 0006).
      */
-    private void buildDemandByZone(KStream<String, RideRequest> validRideRequests) {
+    private KTable<Windowed<String>, Long> buildDemandByZone(KStream<String, RideRequest> validRideRequests) {
         KTable<Windowed<String>, Long> demandByZone = validRideRequests
                 .groupBy((key, request) -> request.pickup().zone(),
                         Grouped.with(Serdes.String(), JsonSerdes.of(RideRequest.class)))
@@ -115,6 +127,8 @@ public class TopologyProducer {
                     return KeyValue.pair(windowedZone.key(), JsonSerdes.toJson(demand));
                 })
                 .to(Topics.DEMAND_BY_ZONE, Produced.with(Serdes.String(), Serdes.String()));
+
+        return demandByZone;
     }
 
     /**
@@ -127,9 +141,10 @@ public class TopologyProducer {
      * contribution d'un chauffeur (ancienne zone, ou statut plus AVAILABLE)
      * avant d'ajouter la nouvelle, donc un chauffeur qui change de zone ou
      * quitte AVAILABLE est decompte de sa zone precedente au lieu de
-     * s'additionner en double.
+     * s'additionner en double. Retourne la KTable (cle zone) pour DISP-4
+     * (cf. buildSurge / ADR 0006).
      */
-    private void publishSupplyByZone(KStream<String, DriverLocation> validDriverLocations) {
+    private KTable<String, Long> publishSupplyByZone(KStream<String, DriverLocation> validDriverLocations) {
         KTable<String, DriverLocation> latestLocationByDriver = validDriverLocations
                 .toTable(Materialized.with(Serdes.String(), JsonSerdes.of(DriverLocation.class)));
 
@@ -142,6 +157,37 @@ public class TopologyProducer {
         supplyByZone.toStream()
                 .mapValues((zone, count) -> JsonSerdes.toJson(new SupplyByZone(zone, count)))
                 .to(Topics.SUPPLY_BY_ZONE, Produced.with(Serdes.String(), Serdes.String()));
+
+        return supplyByZone;
+    }
+
+    /**
+     * DISP-4 (issue #8) : ratio demande/offre par zone. Aplatit d'abord la
+     * demande windowee (cle Windowed&lt;String&gt;) en KTable cle par zone
+     * simple (dernier compte connu, meme cle que l'offre), puis jointure
+     * table-table demande/offre (ADR 0006) : le ratio se recalcule sur
+     * toute mise a jour d'un des deux cotes, pas seulement la demande. Le
+     * ratio non filtre est materialise pour toutes les zones dans
+     * SURGE_RATIO_STORE (ADR 0002, consomme par DISP-6/issue #10) ; le
+     * seuil (> 2) n'est applique qu'a la publication sur Topics.SURGE.
+     */
+    private void buildSurge(KTable<Windowed<String>, Long> demandByZone, KTable<String, Long> supplyByZone) {
+        KTable<String, Long> currentDemandByZone = demandByZone.toStream()
+                .selectKey((windowedZone, count) -> windowedZone.key())
+                .repartition(Repartitioned.with(Serdes.String(), Serdes.Long()))
+                .toTable(Materialized.with(Serdes.String(), Serdes.Long()));
+
+        KTable<String, Double> surgeRatioByZone = currentDemandByZone.leftJoin(
+                supplyByZone,
+                (demand, supply) -> demand / (double) Math.max(supply == null ? 0L : supply, 1L),
+                Materialized.<String, Double, KeyValueStore<Bytes, byte[]>>as(SURGE_RATIO_STORE)
+                        .withKeySerde(Serdes.String())
+                        .withValueSerde(Serdes.Double()));
+
+        surgeRatioByZone.toStream()
+                .filter((zone, ratio) -> ratio > 2.0)
+                .mapValues((zone, ratio) -> JsonSerdes.toJson(new SurgeEvent(zone, ratio)))
+                .to(Topics.SURGE, Produced.with(Serdes.String(), Serdes.String()));
     }
 
     /**
