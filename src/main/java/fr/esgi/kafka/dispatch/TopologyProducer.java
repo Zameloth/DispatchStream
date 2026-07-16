@@ -9,7 +9,6 @@ import fr.esgi.kafka.dispatch.model.TripEvent;
 import fr.esgi.kafka.dispatch.validation.DriverLocationValidation;
 import fr.esgi.kafka.dispatch.validation.RideRequestValidation;
 import fr.esgi.kafka.dispatch.validation.TripEventValidation;
-import io.quarkus.logging.Log;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Produces;
 import org.apache.kafka.common.serialization.Serdes;
@@ -46,10 +45,6 @@ public class TopologyProducer {
         KStream<String, String> rawTrips = builder.stream(
                 Topics.TRIP_EVENTS,
                 Consumed.with(Serdes.String(), Serdes.String()));
-
-        // Sanity check de demarrage : verifiez la connexion au cluster,
-        // puis SUPPRIMEZ ce peek (il pollue les logs et coute cher).
-        rawLocations.peek((key, value) -> Log.infof("[dispatch] %s -> %s", key, value));
 
         // -----------------------------------------------------------------
         // DISP-1 - Ingestion fiable (les TROIS flux)
