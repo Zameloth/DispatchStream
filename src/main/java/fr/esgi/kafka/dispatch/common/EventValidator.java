@@ -27,7 +27,7 @@ import java.util.Optional;
 public final class EventValidator<T> {
 
     public static final String MALFORMED_JSON = "malformed_json";
-    private static final String UNKNOWN_FIELD = "?";
+    private static final String ROOT_FIELD = "<root>";
 
     private static final ObjectMapper MAPPER = new ObjectMapper()
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
@@ -72,7 +72,12 @@ public final class EventValidator<T> {
         return ValidationOutcome.valid(raw, value);
     }
 
-    /** Reconstruit le chemin pointe (ex: "pickup.lat") a partir d'une exception Jackson. */
+    /**
+     * Reconstruit le chemin pointe (ex: "pickup.lat") a partir d'une
+     * exception Jackson. Chemin vide = mismatch au niveau racine (le
+     * message entier n'a pas la forme attendue, ex: un scalaire JSON nu
+     * comme {@code 42} au lieu d'un objet).
+     */
     private static String fieldNameOf(Exception e) {
         if (e instanceof JsonMappingException jme && !jme.getPath().isEmpty()) {
             StringBuilder path = new StringBuilder();
@@ -80,10 +85,14 @@ public final class EventValidator<T> {
                 if (path.length() > 0) {
                     path.append('.');
                 }
-                path.append(ref.getFieldName() != null ? ref.getFieldName() : UNKNOWN_FIELD);
+                if (ref.getFieldName() != null) {
+                    path.append(ref.getFieldName());
+                } else {
+                    path.append('[').append(ref.getIndex()).append(']');
+                }
             }
             return path.toString();
         }
-        return UNKNOWN_FIELD;
+        return ROOT_FIELD;
     }
 }
