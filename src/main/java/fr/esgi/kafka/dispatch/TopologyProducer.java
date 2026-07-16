@@ -7,6 +7,7 @@ import fr.esgi.kafka.dispatch.common.ValidationOutcome;
 import fr.esgi.kafka.dispatch.model.DemandByZone;
 import fr.esgi.kafka.dispatch.model.DriverLocation;
 import fr.esgi.kafka.dispatch.model.RideRequest;
+import fr.esgi.kafka.dispatch.model.SupplyByZone;
 import fr.esgi.kafka.dispatch.model.TripEvent;
 import fr.esgi.kafka.dispatch.validation.DriverLocationValidation;
 import fr.esgi.kafka.dispatch.validation.RideRequestValidation;
@@ -81,6 +82,7 @@ public class TopologyProducer {
         buildDemandByZone(validRideRequests);
 
         // DISP-3 - Offre par zone (KTable des chauffeurs) -> Topics.SUPPLY_BY_ZONE
+        publishSupplyByZone(validDriverLocations);
         // DISP-4 - Surge pricing (demande/offre > 2)     -> Topics.SURGE
         // DISP-5 - Courses anormales (vitesse, duree)    -> Topics.ALERTS_TRIPS
         // DISP-6 (bonus) - API REST Interactive Queries : GET /api/v1/surge/{zone}
