@@ -17,6 +17,7 @@ import fr.esgi.kafka.dispatch.stateful.TripEventStatefulValidation;
 import fr.esgi.kafka.dispatch.validation.DriverLocationValidation;
 import fr.esgi.kafka.dispatch.validation.RideRequestValidation;
 import fr.esgi.kafka.dispatch.validation.TripEventValidation;
+import io.quarkus.logging.Log;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Produces;
 import org.apache.kafka.common.serialization.Serdes;
@@ -56,6 +57,9 @@ public class TopologyProducer {
 
     @Produces
     public Topology buildTopology() {
+        Log.infof("[dispatch] Construction de la topologie (topics=%s,%s,%s, surge_threshold=%.1f)",
+                Topics.RIDE_REQUESTS, Topics.DRIVER_LOCATIONS, Topics.TRIP_EVENTS, SURGE_THRESHOLD);
+
         StreamsBuilder builder = new StreamsBuilder();
         builder.addStateStore(RideRequestStatefulValidation.STORE_BUILDER);
         builder.addStateStore(DriverLocationStatefulValidation.STORE_BUILDER);
@@ -211,6 +215,7 @@ public class TopologyProducer {
 
         surgeRatioByZone.toStream()
                 .filter((zone, ratio) -> ratio > SURGE_THRESHOLD)
+                .peek((zone, ratio) -> Log.infof("[dispatch] Surge declenche (zone=%s, ratio=%.2f)", zone, ratio))
                 .mapValues((zone, ratio) -> JsonSerdes.toJson(new SurgeEvent(zone, ratio)))
                 .to(Topics.SURGE, Produced.with(Serdes.String(), Serdes.String()));
     }
@@ -227,6 +232,8 @@ public class TopologyProducer {
                 .filter((tripId, event) -> "END".equals(event.event()))
                 .mapValues(GhostTripDetection::evaluate)
                 .filter((tripId, alert) -> alert.isPresent())
+                .peek((tripId, alert) -> Log.infof("[dispatch] Ghost trip detecte (tripId=%s, reason=%s)",
+                        tripId, alert.get().reason()))
                 .mapValues(alert -> JsonSerdes.toJson(alert.get()))
                 .to(Topics.ALERTS_TRIPS, Produced.with(Serdes.String(), Serdes.String()));
     }
@@ -273,12 +280,15 @@ public class TopologyProducer {
 
         KStream<String, ValidationOutcome.Valid<T>> valid = outcomes
                 .filter((key, outcome) -> outcome instanceof ValidationOutcome.Valid<T>)
+                .peek((key, outcome) -> Log.debugf("[dispatch] Valide (topic=%s, key=%s)", sourceTopic, key))
                 .mapValues(outcome -> (ValidationOutcome.Valid<T>) outcome);
 
         outcomes
                 .filter((key, outcome) -> outcome instanceof ValidationOutcome.Invalid<T>)
                 .map((key, outcome) -> {
                     ValidationOutcome.Invalid<T> invalid = (ValidationOutcome.Invalid<T>) outcome;
+                    Log.warnf("[dispatch] Rejet DLQ (topic=%s, key=%s, reason=%s)",
+                            sourceTopic, key, invalid.reason());
                     DlqEnvelope envelope = new DlqEnvelope(
                             sourceTopic, key, invalid.raw(), invalid.reason(),
                             Instant.now().toString());
