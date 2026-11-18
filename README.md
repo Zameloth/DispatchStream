@@ -1,237 +1,182 @@
-# Projet DISPATCH — Plateforme VTC temps réel
+# DISPATCH — pipeline VTC temps réel (Quarkus + Kafka Streams)
 
-*Framework imposé : **Quarkus 3.19 + Kafka Streams***
+Pipeline de streaming pour une plateforme de VTC fictive opérant sur Paris.
+L'application consomme trois flux Kafka (demandes de course, pings GPS des
+chauffeurs, événements de course) volontairement sales et :
 
-## Contexte
+- **valide** chaque message et envoie les invalides dans une DLQ, avec le message original et une raison précise, **sans jamais crasher** ;
+- calcule la **demande** par zone (fenêtres tumbling de 2 min) ;
+- calcule l'**offre** par zone, à partir de la dernière position connue de chaque chauffeur ;
+- déclenche le **surge pricing** quand `demande / max(offre, 1) > 2` ;
+- signale les **courses fantômes** (vitesse moyenne > 130 km/h ou durée > 3 h) ;
+- expose le surge courant par zone via une **API REST Interactive Queries**.
 
-Vous rejoignez l'équipe Marketplace de **DISPATCH**, une plateforme de VTC
-opérant sur Paris (pensez Uber). Trois flux arrivent en continu : les demandes
-de course des passagers, les pings GPS des 80 chauffeurs (toutes les ~8 s), et
-les événements de course (`START`/`END`). Le produit veut piloter le **surge
-pricing** : quand la demande explose dans une zone par rapport au nombre de
-chauffeurs disponibles (sortie de concert à Bercy…), le prix doit monter. Et
-l'équipe fraude veut détecter les **courses fantômes** : 900 km en 20 minutes,
-ou 6 heures de course pour 12 km.
-
-Les GPS de certains téléphones envoient des coordonnées aberrantes, des champs
-manquants, du JSON tronqué. **Le flux ne sera jamais propre : c'est à votre
-pipeline d'être robuste.**
-
-## Mission
-
-Construire une application **Quarkus + Kafka Streams** qui consomme les trois
-flux, écarte proprement les messages invalides, calcule l'offre et la demande
-par zone, déclenche le surge et signale les courses anormales.
+> Projet réalisé en binôme dans le cadre d'un module Kafka à l'ESGI (2026).
+> Le sujet imposait Quarkus 3.19 + Kafka Streams et les topics d'entrée.
 
 ## Architecture
 
 ```
 dispatch.ride.requests ────┐
-dispatch.driver.locations ─┼─> [ VALIDATION ] ──> invalides ──> <grp>.dispatch.dlq
-dispatch.trip.events ──────┘        │
-                                    ▼ valides
-              ┌───────────────┬─────┴─────────┬────────────────┐
-              ▼               ▼               ▼                ▼
-        demande/zone    offre/zone      surge (ratio)    courses anormales
-        (tumbling 2min) (KTable)        demande/offre>2  (vitesse, durée)
-              │               │               │                │
-              ▼               ▼               ▼                ▼
-        <grp>.dispatch. <grp>.dispatch. <grp>.dispatch.  <grp>.dispatch.
-        demand.by-zone  supply.by-zone  surge            alerts.trips
+dispatch.driver.locations ─┼─> [ validation stateless ] ─> [ validation stateful ] ──> invalides ──> <grp>.dispatch.dlq
+dispatch.trip.events ──────┘   champs, types, bornes GPS,   retard, doublons,
+                               enums, timestamp              conflits, END orphelins
+                                                    │
+                                                    ▼ valides
+              ┌───────────────┬─────────────────────┴───────┬──────────────────┐
+              ▼               ▼                             ▼                  ▼
+        demande/zone    offre/zone                   surge (ratio)      courses fantômes
+        tumbling 2 min  KTable par chauffeur         jointure           vitesse > 130 km/h
+        grace 6 min     → ré-agrégation par zone     table-table        ou durée > 3 h
+              │               │                             │                  │
+              ▼               ▼                             ▼                  ▼
+        <grp>.dispatch. <grp>.dispatch.              <grp>.dispatch.    <grp>.dispatch.
+        demand.by-zone  supply.by-zone               surge              alerts.trips
+                                                            │
+                                                            ▼
+                                          state store → GET /api/v1/surge/{zone}
 ```
 
 Les 12 zones : `Z-CHATELET, Z-MONTMARTRE, Z-BASTILLE, Z-BERCY, Z-DEFENSE,
 Z-ETOILE, Z-MONTPARNASSE, Z-BELLEVILLE, Z-ODEON, Z-PIGALLE, Z-NATION, Z-AUTEUIL`.
 
-## Topics et formats
+Le vocabulaire métier (événement invalide, en retard, doublon, conflit, END
+orphelin, offre, demande, surge…) est défini dans [`CONTEXT.md`](CONTEXT.md).
+Les choix de conception sont documentés dans [`docs/adr/`](docs/adr) :
 
-### Entrées (fournies — ne jamais écrire dedans)
+| ADR | Décision |
+|-----|----------|
+| [0001](docs/adr/0001-continuous-emission-for-demand-by-zone.md) | Émission continue de la demande (pas de `suppress()`) pour un surge réactif |
+| [0002](docs/adr/0002-dual-materialization-for-surge-ratio.md) | Ratio de surge matérialisé pour toutes les zones, filtre `> 2` uniquement sur le topic |
+| [0003](docs/adr/0003-stateless-scope-for-disp-1.md) | Ingestion d'abord stateless, détections stateful dans un second temps |
+| [0004](docs/adr/0004-two-phase-parse-for-malformed-vs-wrong-type.md) | Parse en deux temps pour distinguer JSON cassé et mauvais type |
+| [0005](docs/adr/0005-crash-safety-net-for-disp-1.md) | `StreamsUncaughtExceptionHandler` en `REPLACE_THREAD` comme filet de sécurité |
+| [0006](docs/adr/0006-table-table-join-for-surge-ratio.md) | Jointure table-table demande × offre |
+| [0007](docs/adr/0007-stateful-validation-for-late-duplicate-conflicting-orphan.md) | Validation stateful (Processor API) pour les retards, doublons, conflits et END orphelins |
 
-**`dispatch.ride.requests`** — clé : `user_id` :
+## Topics
+
+### Entrées
+
+| Topic | Clé | Contenu |
+|-------|-----|---------|
+| `dispatch.ride.requests` | `user_id` | `request_id`, `user_id`, `pickup{lat,lon,zone}`, `dropoff{lat,lon,zone}`, `timestamp` |
+| `dispatch.driver.locations` | `driver_id` | `driver_id`, `lat`, `lon`, `zone`, `status` (`AVAILABLE`/`BUSY`/`OFFLINE`), `timestamp` |
+| `dispatch.trip.events` | `trip_id` | `trip_id`, `driver_id`, `user_id`, `event` (`START`/`END`), `distance_km` et `duration_seconds` (sur les `END`), `timestamp` |
+
+Environ 7 % des messages sont invalides : champs absents ou `null`, mauvais
+types, GPS hors de Paris (`48.7 ≤ lat ≤ 49.0`, `2.2 ≤ lon ≤ 2.5`), enums
+inconnues, timestamps illisibles, JSON tronqué. S'y ajoutent des retards et
+des doublons.
+
+### Sorties
+
+Toutes les sorties sont préfixées par `GROUPE` (variable d'environnement,
+`grp00` par défaut).
+
+**`<grp>.dispatch.dlq`** : un message par rejet, avec le message original
+conservé octet pour octet.
 
 ```json
 {
-  "request_id": "req-398d1ca6",
-  "user_id": "u-0278",
-  "pickup": {
-    "lat": 48.854972,
-    "lon": 2.375735,
-    "zone": "Z-BASTILLE"
-  },
-  "dropoff": {
-    "lat": 48.848057,
-    "lon": 2.363855,
-    "zone": "Z-NATION"
-  },
-  "timestamp": "2026-07-04T14:03:21.512Z"
+  "source_topic": "dispatch.driver.locations",
+  "key": "drv-034",
+  "raw_value": "{\"driver_id\": \"drv",
+  "reason": "malformed_json",
+  "rejected_at": "2026-07-15T22:53:48.113Z"
 }
 ```
 
-**`dispatch.driver.locations`** — clé : `driver_id` — un ping toutes les ~8 s
-par chauffeur, `status` ∈ `AVAILABLE | BUSY | OFFLINE` :
+Les raisons possibles :
+
+- `malformed_json`, `wrong_type:<champ>`, `missing_field:<champ>` ;
+- `gps_out_of_bounds[:pickup|:dropoff]`, `unknown_zone[:pickup|:dropoff]`, `unknown_status`, `unknown_event` ;
+- `unparseable_timestamp`, `invalid_distance_km`, `invalid_duration_seconds` ;
+- `late` (arrivé plus de 6 min après son timestamp) ;
+- `duplicate` ;
+- `conflicting location for driver at timestamp` ;
+- `no matching START for trip_id`.
+
+**`<grp>.dispatch.demand.by-zone`** (clé = zone) : émis à chaque mise à jour,
+donc plusieurs fois par fenêtre (cf. ADR 0001).
 
 ```json
-{
-  "driver_id": "drv-034",
-  "lat": 48.864121,
-  "lon": 2.340588,
-  "zone": "Z-CHATELET",
-  "status": "AVAILABLE",
-  "timestamp": "2026-07-04T14:03:21.512Z"
-}
+{ "zone": "Z-BERCY", "window_start": "2026-07-15T22:52:00Z", "window_end": "2026-07-15T22:54:00Z", "count": 17 }
 ```
 
-**`dispatch.trip.events`** — clé : `trip_id` — `event` ∈ `START | END` ;
-`distance_km` et `duration_seconds` **uniquement sur les END** (ce sont les
-valeurs réelles de la course ; le flux est accéléré, le END arrive quelques
-dizaines de secondes après le START) :
+**`<grp>.dispatch.supply.by-zone`** (clé = zone)
+
+```json
+{ "zone": "Z-BERCY", "available_drivers": 4 }
+```
+
+**`<grp>.dispatch.surge`** (clé = zone) : uniquement quand le ratio dépasse 2.
+
+```json
+{ "zone": "Z-BERCY", "ratio": 4.25 }
+```
+
+**`<grp>.dispatch.alerts.trips`** (clé = `trip_id`) : `reason` vaut
+`excessive_speed` ou `excessive_duration`.
 
 ```json
 {
   "trip_id": "trip-74daaebf",
   "driver_id": "drv-015",
-  "user_id": "u-0398",
-  "event": "END",
-  "distance_km": 7.42,
-  "duration_seconds": 1260,
-  "timestamp": "2026-07-04T14:05:41.203Z"
+  "reason": "excessive_speed",
+  "average_speed_kmh": 2700.0,
+  "distance_km": 900.0,
+  "duration_seconds": 1200,
+  "timestamp": "2026-07-15T22:55:41.203Z"
 }
 ```
 
-### Anomalies présentes dans le flux (~7 % + retards + doublons)
+### API REST
 
-| Anomalie                               | Exemple                     | Impact si non gérée                       |
-|----------------------------------------|-----------------------------|-------------------------------------------|
-| Champ requis absent                    | pas de `zone`               | agrégat par zone faux                     |
-| Champ à `null`                         | `"status": null`            | NullPointerException                      |
-| Mauvais type                           | `"lat": "douze"`            | crash de désérialisation                  |
-| GPS hors bornes                        | `lat: 91.2` ou hors Paris   | zones polluées                            |
-| Enum inconnue                          | `"status": "AVAILABLEE"`    | offre surestimée                          |
-| Timestamp illisible                    | `"hier a 15h"`              | fenêtrage cassé                           |
-| JSON tronqué / non-JSON / message vide | `{"driver_id": "drv`        | **poison pill : l'appli meurt en boucle** |
-| Événement en retard                    | timestamp − 30 à 180 min    | fenêtres faussées                         |
-| Doublon exact                          | même `request_id` deux fois | demande double-comptée                    |
+`GET http://localhost:8090/api/v1/surge/{zone}` lit le state store du surge et
+renvoie le ratio courant, même hors surge :
 
-Bornes de validité GPS pour ce projet : `48.7 ≤ lat ≤ 49.0` et `2.2 ≤ lon ≤ 2.5`.
+```json
+{ "zone": "Z-BERCY", "ratio": 4.25, "surging": true }
+```
 
-### Sorties (à produire, préfixées par votre groupe)
+Elle renvoie `404` pour une zone inconnue et `503` tant que le store n'est pas
+encore interrogeable (démarrage ou rebalance).
 
-`<grp>.dispatch.dlq` · `<grp>.dispatch.demand.by-zone` ·
-`<grp>.dispatch.supply.by-zone` · `<grp>.dispatch.surge` ·
-`<grp>.dispatch.alerts.trips` — constantes prêtes dans `Topics.java`. Format
-des valeurs libre **mais en JSON documenté dans votre README de rendu**.
+## Lancer le projet
 
-## Backlog
-
-> La base 8/20 = DISP-1 fonctionnel de bout en bout sur le cluster partagé.
-> Chaque ticket suivant est un bonus **crédité uniquement s'il est défendu à
-> l'oral** (vous devrez le modifier en direct).
-
-**DISP-1 — Ingestion fiable (socle, obligatoire)**
-Consommer les **trois** topics, parser, valider (champs requis, types, bornes
-GPS ci-dessus, enums, timestamp ISO-8601 parsable). Invalides → DLQ **avec
-message original + raison**. L'application ne doit **jamais** crasher.
-*Critères : 10 min sans crash ; DLQ motivée ; aucun message valide perdu.*
-
-**DISP-2 — Demande par zone** → `<grp>.dispatch.demand.by-zone`
-Nombre de demandes par `pickup.zone` sur **fenêtres tumbling de 2 min**.
-*Critères : clé = zone ; les rafales de Bercy (~toutes les 6 min) se voient
-dans les comptes.*
-
-**DISP-3 — Offre par zone** → `<grp>.dispatch.supply.by-zone`
-Nombre de chauffeurs `AVAILABLE` par zone, basé sur la **dernière position
-connue** de chaque chauffeur (KTable clée par `driver_id`, puis ré-agrégation
-par zone — c'est le ticket subtil : un chauffeur qui change de zone doit être
-décompté de l'ancienne).
-*Critères : la somme des offres par zone ≤ 80 ; un chauffeur passé OFFLINE
-disparaît de l'offre.*
-
-**DISP-4 — Surge pricing** → `<grp>.dispatch.surge`
-Croiser demande (DISP-2) et offre (DISP-3) par zone ; si
-`demande / max(offre, 1) > 2`, émettre un événement de surge avec le ratio.
-Le générateur provoque un surge à Bercy environ toutes les 6 min.
-*Critères : chaque incident `surge_bercy` déclenche un surge sur Z-BERCY ;
-silence ailleurs ; choix du type de jointure justifié.*
-
-**DISP-5 — Courses anormales** → `<grp>.dispatch.alerts.trips`
-Sur les `END` : vitesse moyenne = `distance_km / (duration_seconds/3600)`.
-Alerte si **vitesse > 130 km/h** ou **duration_seconds > 10800** (3 h). Le
-générateur injecte une course fantôme toutes les ~5 min.
-*Critères : chaque `ghost_trip` est détectée avec la raison (vitesse ou durée) ;
-pas de faux positifs sur le trafic normal (15–40 km/h).*
-
-**DISP-6 (bonus) — API Interactive Queries**
-Compléter `SurgeResource` : `GET /api/v1/surge/{zone}` lit le state store de
-DISP-4 (`@Inject KafkaStreams` fourni par l'extension Quarkus).
-*Critères : la valeur renvoyée correspond au topic surge ; 404 propre si la
-zone est inconnue.*
-
-## Démarrage rapide
-
-Prérequis : JDK 21, Maven 3.9+, Docker.
+Prérequis : JDK 21, Maven 3.9+, Docker, Python 3 (pour le rejeu).
 
 ```bash
-# 1. Cluster local pour développer (3 brokers KRaft + Kafbat UI sur :8080)
-docker compose up -d
+cp .env.example .env               # GROUPE, KAFKA_BOOTSTRAP
+scripts/up.sh                      # cluster Kafka 3 brokers + Kafbat UI (:8080), topics d'entrée, build et lancement de l'appli (:8090)
 
-# 2. Lancer en mode dev (live reload sur http://localhost:8090)
-GROUPE=grp07 KAFKA_BOOTSTRAP=localhost:29092 mvn quarkus:dev
+python -m venv scripts/.venv && scripts/.venv/bin/pip install -r scripts/requirements.txt
+scripts/.venv/bin/python scripts/rejouer.py --dossier data/raw --bootstrap localhost:29092
+# rejoue ~192k messages réels (data/raw/*.jsonl) dans l'ordre chronologique ; --speed 1 pour le temps réel
+
+scripts/down.sh                    # arrête l'appli et le cluster
+scripts/reset.sh                   # repart à blanc (purge aussi l'état RocksDB local)
 ```
 
-```powershell
-# Windows PowerShell
-$env:GROUPE = "grp07"
-$env:KAFKA_BOOTSTRAP = "localhost:29092"
-mvn quarkus:dev
+Les logs de l'appli sont écrits dans `scripts/.run/app-<GROUPE>.log`. Les
+topics sont consultables dans Kafbat UI sur http://localhost:8080.
+
+> `mvn quarkus:dev` ne fonctionne pas tel quel : les Dev Services de Quarkus
+> tentent de lancer leur propre Kafka. Il faut lancer le jar packagé, ce que
+> fait `up.sh`.
+
+## Tests
+
+```bash
+mvn test
 ```
 
-Vous en avez le droit — l'IA est autorisée dans ce module. Mais sachez ce que vous achetez : ce projet est évalué à
-l'oral, code sous les yeux, avec modification en direct et nouvelles exigences métier injectées séance tenante. Un
-ticket qui tourne mais que vous ne savez pas expliquer n'est pas crédité.
-Demandez-lui d'expliquer chaque choix avant d'écrire une ligne : type de fenêtre, clé d'agrégation, placement de la
-jointure, sort des retardataires. C'est mot pour mot ce qu'on vous demandera en soutenance.
-Et sachez-le : ce sujet contient des exigences qu'une implémentation produite sans l'avoir lu ne satisfera pas. Elles
-sont écrites noir sur blanc, dans le tableau des anomalies et dans les critères de chaque ticket. Le correcteur
-automatique les vérifie et les chiffre. Si vous ne les avez pas trouvées, c'est que vous n'avez pas lu.
+La topologie est testée avec `TopologyTestDriver` : validation stateless et
+stateful pour chaque flux, demande, offre, surge, courses fantômes et API REST.
+Aucun broker n'est nécessaire.
 
-**Important** : l'extension Quarkus attend que les topics listés dans
-`quarkus.kafka-streams.topics` existent avant de démarrer la topologie. En
-local, créez-les d'abord dans Kafbat UI (mêmes noms, 3 partitions suffisent),
-puis produisez des messages à la main avec les exemples JSON ci-dessus. Sur le
-cluster partagé, ils existent déjà (`KAFKA_BOOTSTRAP=<serveur>:9092`).
+## Stack
 
-## Contraintes
-
-- Java 21, Quarkus + Kafka Streams uniquement (pas de Spark/Flink), pas de
-  base externe.
-- `GROUPE` obligatoire : topics de sortie et `application.id`
-  (`dispatch-<groupe>`) préfixés — déjà câblé.
-- Topics d'entrée partagés en lecture : **ne les modifiez pas**.
-- Code versionné sur Git, commits réguliers de **tous** les membres.
-
-## Évaluation
-
-| Élément                                                    | Points |
-|------------------------------------------------------------|--------|
-| Socle DISP-1 en production 10 min sans crash + DLQ motivée | **8**  |
-| DISP-2 (demande par zone)                                  | +2     |
-| DISP-3 (offre par zone, dernière position)                 | +3     |
-| DISP-4 (surge, jointure demande × offre)                   | +3     |
-| DISP-5 (courses anormales)                                 | +2     |
-| DISP-6 (API IQ) ou tests TopologyTestDriver sérieux        | +2     |
-
-Plafond 20. **Un ticket non expliqué à l'oral = non crédité.** Attendez-vous à
-une demande de modification en direct (« Product Owner twist »).
-
-## Conseils
-
-- Le `Log.infof` fourni sert au premier contact : supprimez-le ensuite.
-- Poison pill dès le premier jour : `JsonSerdes.parseOrNull` évite le crash,
-  la validation métier vous appartient.
-- DISP-3 : `groupBy((driverId, loc) -> loc.zone())` sur une **KTable** fait
-  exactement le décompte « entrant/sortant » attendu — regardez la
-  documentation de `KGroupedTable#count`.
-- DISP-4 : deux tables avec des clés « zone » se joignent naturellement ;
-  attention aux fenêtres côté demande (les types diffèrent).
-- `split()`/`branch()` — l'ancienne API `branch(Predicate...)` a disparu en
-  Kafka 4.0.
+Java 21 · Quarkus 3.19 · Kafka Streams (Kafka 4.x) · Jackson · JUnit 5 · Docker
+Compose (Kafka KRaft 3 brokers + Kafbat UI).
